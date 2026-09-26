@@ -29,7 +29,7 @@ pip install -r requirements-dev.txt
 python -m pytest tests/
 ```
 
-`tests/` 为菲涅耳透过率尺度边界与两个功率接口的 pytest 回归测试（含两侧同为 `1e308`、同为次正规数 `5e-324` 斜入射等边界复现），测试库使用临时 SQLite 文件，不影响卷内数据；Docker 镜像不包含测试目录，`docker compose up --build` 无需开发依赖。
+`tests/` 为菲涅耳透过率尺度边界、两个功率接口与波前大坐标直线拟合（含观察线 `x=1e200` 的边界复现）的 pytest 回归测试（含两侧同为 `1e308`、同为次正规数 `5e-324` 斜入射等边界复现），测试库使用临时 SQLite 文件，不影响卷内数据；Docker 镜像不包含测试目录，`docker compose up --build` 无需开发依赖。
 
 ## API 一览
 
@@ -514,8 +514,8 @@ curl -X POST http://localhost:8000/api/detector-power-evaluations \
 - **有效光线**：仅追迹状态为 `completed` 且出射段与观察线存在**前向交点**的光线有效；其余光线（全反射 / 中途无交点 / 与观察线平行或交点在反方向）保留 `status` 与 `reason`，`observation_point` / `optical_path` / `offset` / `residual` 均为 `null`。
 - **光程** `optical_path`：`Σ(各界面间线段长度 × 所在介质折射率) + 出射段到观察线交点的长度 × 出射介质折射率`（各段方向均已归一化，长度即欧氏距离）。
 - **切向偏移** `offset`：观察线法线归一化后**逆时针旋转 90°** 得单位切向量 `t`（响应中回显为 `tangent`），`offset = (观察线交点 − 观察线给定点) · t`，作为拟合横坐标。
-- **直线拟合**：对全部有效光线的 `(offset, optical_path)` 做等权最小二乘拟合 `光程 ≈ intercept + slope · offset`；逐光线 `residual = optical_path − (intercept + slope · offset)`，`residual_rms` 为残差平方均值的开方。
-- **拟合失效**：有效光线**少于 3 条**或**偏移全相同**（斜率不可定）时，`intercept` / `slope` / `residual_rms` 均为 `null`，此时有效光线的 `residual` 也为 `null`（`optical_path` 与 `offset` 仍正常返回）。
+- **直线拟合**：对全部有效光线的 `(offset, optical_path)` 做等权最小二乘拟合 `光程 ≈ intercept + slope · offset`；逐光线 `residual = optical_path − (intercept + slope · offset)`，`residual_rms` 为残差平方均值的开方。拟合在**双轴尺度归一化**坐标下计算（横纵坐标分别除以 `max|offset|`、`max|optical_path|` 后再求斜率与残差、乘回尺度，见下文「大坐标（远观察线）尺度边界」），故观察线远至 `1e200`、偏移与光程约 `1e200` 时离差平方不再溢出（旧实现报 `500`），截距 / 斜率 / 残差 / RMS 均为有限值；该公式与直接对原始坐标拟合数学等价，普通尺度下仅差末位 1～2 ULP。
+- **拟合失效**：有效光线**少于 3 条**或**偏移全相同**（斜率不可定）时，`intercept` / `slope` / `residual_rms` 均为 `null`，此时有效光线的 `residual` 也为 `null`（`optical_path` 与 `offset` 仍正常返回）；所有输入点均有限而拟合结果仍不可表示（直线在浮点下不可表示）时同样按失效返回 `null`。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -549,9 +549,9 @@ curl -X POST http://localhost:8000/api/wavefront-evaluations \
   "ray_count": 5,
   "hit_count": 5,
   "tangent": {"x": 0.0, "y": 1.0},
-  "intercept": 11.071742133570087,
+  "intercept": 11.071742133570085,
   "slope": 0.0,
-  "residual_rms": 0.06019273926764479,
+  "residual_rms": 0.06019273926764485,
   "rays": [
     {
       "emission_angle_deg": -10.0,
@@ -561,7 +561,7 @@ curl -X POST http://localhost:8000/api/wavefront-evaluations \
       "observation_point": {"x": 10.0, "y": -1.6437139662827691},
       "optical_path": 11.143719692602911,
       "offset": -1.6437139662827691,
-      "residual": 0.07197755903282399
+      "residual": 0.07197755903282489
     },
     {
       "emission_angle_deg": 0.0,
@@ -571,7 +571,7 @@ curl -X POST http://localhost:8000/api/wavefront-evaluations \
       "observation_point": {"x": 10.0, "y": 0.0},
       "optical_path": 11.0,
       "offset": 0.0,
-      "residual": -0.07174213357008696
+      "residual": -0.07174213357008595
     }
   ]
 }
@@ -582,6 +582,37 @@ curl -X POST http://localhost:8000/api/wavefront-evaluations \
 - `intercept` / `slope`：等权最小二乘拟合的截距与斜率；拟合失效时为 `null`。
 - `residual_rms`：有效光线残差平方均值的开方；拟合失效时为 `null`。
 - `rays[]` 按发射角从 `-a` 到 `+a` 排列，字段含义同光束评估，另含 `optical_path`（光程）、`offset`（切向偏移）、`residual`（扣除拟合值后的残差）；无效光线三者均为 `null`。
+
+### 大坐标（远观察线）尺度边界：拟合的双轴尺度归一化
+
+直线拟合在**双轴尺度归一化**坐标下进行，避免大坐标离差平方溢出：取两个坐标轴的绝对量级 `sx = max|offset|`、`sy = max|optical_path|`（直接取最大绝对值，不做大坐标相减，故正负两侧都接近 `1.8e308` 时也不会先在差值上溢出），令 `u = offset/sx`、`v = optical_path/sy`，归一化坐标恒在 `[−1, 1]` 内；在归一化坐标下求斜率 `m = Σ(u−ū)(v−v̄)/Σ(u−ū)²` 与逐点残差，再乘回尺度（`slope = m·sy/sx`、`intercept = sy·(v̄ − m·ū)`、`residual = sy·(v − v̄ − m·(u − ū))`），残差 RMS 先在 `[−1, 1]` 量级内求 `sqrt(mean(nr²))` 再乘 `sy`，避免大尺度残差先平方溢出为无穷。该公式与直接对原始坐标做最小二乘数学等价，普通尺度下仅差末位 1～2 ULP 的浮点舍入，既有语义不变。
+
+旧实现直接累加 `(offset − mean_offset)²` 等离差平方量：观察线很远（如下例 `x = 1e200`）时，三条光线的观察线交点与光程本身都**有限**（偏移约 `±5.8e199`、光程约 `1e200`），但偏移离差平方约 `(5.8e199)² ≈ 3.3e399` 超出双精度浮点范围（上限约 `1.8e308`），抛 `OverflowError`、接口返回 `500`；尺度归一化后截距、斜率、逐光线残差与残差 RMS 全部为有限值，接口正常返回 `200`。
+
+```bash
+# 一键启动（Docker Compose，构建镜像、安装依赖并自动建库）
+docker compose up --build
+# 服务地址 http://localhost:8000 ，交互式文档 http://localhost:8000/docs
+
+# 无界面、观察线 x=1e200、中心方向 (1,0)、半角 30°、采样 3 条、n_start=1：
+# 交点与光程均有限，旧实现偏移离差平方溢出报 500，现返回有限拟合结果
+curl -X POST http://localhost:8000/api/wavefront-evaluations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start": {"x": 0, "y": 0},
+    "center_direction": {"x": 1, "y": 0},
+    "half_angle_deg": 30,
+    "sample_count": 3,
+    "n_start": 1,
+    "interfaces": [],
+    "observation_line": {"point": {"x": 1e200, "y": 0}, "normal": {"x": 1, "y": 0}}
+  }'
+# hit_count = 3；slope = 0.0（三点关于 offset=0 对称）；
+# intercept ≈ 1.1031336922528344e+200（三条光线光程的均值）；
+# residual_rms ≈ 7.292653316078563e+198；各光线 optical_path / offset / residual 均为有限值
+```
+
+即使输入点正负两侧都接近浮点上界（如偏移 `±1e308`，连坐标差值 `2e308` 本身都溢出为无穷），`max|·|` 尺度与归一化聚合仍给出有限拟合。有效光线**少于 3 条**或**偏移全相同**（斜率不可定）时仍按拟合失效处理，`intercept` / `slope` / `residual_rms` 为 `null`；所有输入均有限而拟合结果（斜率 / 截距 / 任一残差 / RMS）仍不可表示（拟合直线在浮点下不可表示）时同样返回 `null`。
 
 ## 瞄准求解
 
@@ -958,11 +989,11 @@ curl -X POST http://localhost:8000/api/chromatic-beam-evaluations \
 ```
 app/
   main.py       FastAPI 路由与生命周期（启动时建库）
-  geometry.py   二维求交、数值稳定的斯涅尔折射（极大折射率比下不溢出、正入射保持方向）、方向采样、光斑质心/RMS、菲涅耳 s/p 透过率（折射率先按共同尺度 max(n1,n2) 归一化，两侧同为 1e308 不溢出、同为次正规数 5e-324 斜入射不下溢除零，等折射率界面严格 Ts=Tp=1）与功率加权质心、探测线功率分箱（相邻分箱中心线性分配、边缘截断）、波前光程与等权最小二乘直线拟合、瞄准求解（扫描+二分）、装调灵敏度（逐界面法线 ±扰动与中心差分）、焦点搜索（观察线沿法线平移扫描 + 低谷黄金分割细化）、折射率标定（固定其余界面替换目标 n_next，均方残差扫描 + 低谷黄金分割细化）、有限口径追迹（逐界面口径半宽检查，首个失败界面终止）、柯西色散折射率（n=A+B/λ²）
+  geometry.py   二维求交、数值稳定的斯涅尔折射（极大折射率比下不溢出、正入射保持方向）、方向采样、光斑质心/RMS、菲涅耳 s/p 透过率（折射率先按共同尺度 max(n1,n2) 归一化，两侧同为 1e308 不溢出、同为次正规数 5e-324 斜入射不下溢除零，等折射率界面严格 Ts=Tp=1）与功率加权质心、探测线功率分箱（相邻分箱中心线性分配、边缘截断）、波前光程与等权最小二乘直线拟合（横纵坐标按 max|·| 双轴尺度归一化，观察线 x=1e200 等大坐标下离差平方不溢出，残差 RMS 先在归一化坐标聚合再乘回尺度）、瞄准求解（扫描+二分）、装调灵敏度（逐界面法线 ±扰动与中心差分）、焦点搜索（观察线沿法线平移扫描 + 低谷黄金分割细化）、折射率标定（固定其余界面替换目标 n_next，均方残差扫描 + 低谷黄金分割细化）、有限口径追迹（逐界面口径半宽检查，首个失败界面终止）、柯西色散折射率（n=A+B/λ²）
   comparison.py 两条已保存追迹的状态与分段对齐比较（统一浮点容差、缺段报告）
   db.py         SQLite 持久化（traces / segments 两表）
   schemas.py    Pydantic 请求 / 响应模型
-tests/          菲涅耳透过率尺度边界与两个功率接口的 pytest 回归测试（开发依赖见 requirements-dev.txt）
+tests/          菲涅耳透过率尺度边界、两个功率接口与波前大坐标直线拟合的 pytest 回归测试（开发依赖见 requirements-dev.txt）
 Dockerfile
 docker-compose.yml
 requirements.txt

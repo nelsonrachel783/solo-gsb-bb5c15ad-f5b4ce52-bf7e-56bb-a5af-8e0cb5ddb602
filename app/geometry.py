@@ -373,6 +373,21 @@ def linear_least_squares(
     点数少于 WAVEFRONT_MIN_FIT_RAYS（3）或 x 全相同（斜率不可定）时返回
     None；否则返回 (intercept, slope, 逐点残差, 残差 RMS)，其中残差 =
     y − (intercept + slope · x)，RMS 为残差平方均值的开方。
+
+    计算在**双轴尺度归一化**坐标下进行，避免大坐标离差平方溢出：取两个
+    坐标轴的绝对量级 sx = max|x|、sy = max|y|（直接取最大绝对值，不做
+    大坐标相减，故正负两侧都接近 1.8e308 时也不会先在差值上溢出），令
+    u = x/sx、v = y/sy，则所有归一化坐标都在 [−1, 1] 内，离差平方和
+    Σ(u − ū)² 等中间量不再随坐标尺度（如观察线 x=1e200 时偏移约
+    ±5.8e199、光程约 1e200）溢出为无穷或抛出 OverflowError。归一化拟合
+    斜率 m = Σ(u−ū)(v−v̄)/Σ(u−ū)²，还原得
+        slope = m · sy / sx，intercept = sy · (v̄ − m · ū)，
+    与直接对原始坐标做最小二乘数学等价，普通尺度下仅差末位浮点舍入。
+    逐点残差在归一化坐标下计算（residual = sy·(v − v̄ − m·(u − ū))），
+    RMS 先在 [−1,1] 量级内求 sqrt(mean(nr²)) 再乘 sy 还原，避免大尺度
+    残差（如 5e198）先平方溢出为无穷。所有输入点均有限而结果（斜率 /
+    截距 / 任一残差 / RMS）仍不可表示（溢出为无穷或 NaN，即拟合直线在
+    浮点下不可表示）时返回 None；调用方按拟合失效处理。
     """
     count = len(points)
     if count < WAVEFRONT_MIN_FIT_RAYS:
@@ -380,16 +395,35 @@ def linear_least_squares(
     x0 = points[0][0]
     if all(p[0] == x0 for p in points):
         return None  # 偏移全相同：0/0，斜率不可定
-    mean_x = sum(p[0] for p in points) / count
-    mean_y = sum(p[1] for p in points) / count
-    sxx = sum((p[0] - mean_x) ** 2 for p in points)
-    if sxx == 0.0:
-        return None  # 数值兜底：离差平方和为 0 等价于 x 全同
-    sxy = sum((p[0] - mean_x) * (p[1] - mean_y) for p in points)
-    slope = sxy / sxx
-    intercept = mean_y - slope * mean_x
-    residuals = [p[1] - (intercept + slope * p[0]) for p in points]
-    rms = math.sqrt(sum(r * r for r in residuals) / count)
+    # 双轴绝对量级：max|·| 不做差值，正负方向都接近上界（如 ±1e308）时
+    # 也不会先在 (x − x0) 上溢出为无穷
+    sx = max(abs(p[0]) for p in points)
+    sy = max(abs(p[1]) for p in points)
+    if sy == 0.0:
+        # 光程全为 0：精确的水平直线（斜率 0、截距 0、残差全 0）
+        return 0.0, 0.0, [0.0] * count, 0.0
+    us = [p[0] / sx for p in points]
+    vs = [p[1] / sy for p in points]
+    mean_u = sum(us) / count
+    mean_v = sum(vs) / count
+    du = [u - mean_u for u in us]
+    dv = [v - mean_v for v in vs]
+    suu = sum(z * z for z in du)
+    if suu == 0.0:
+        return None  # 数值兜底：归一化离差平方和为 0 等价于 x 全同
+    m = sum(a * b for a, b in zip(du, dv)) / suu  # 归一化坐标下的斜率
+    if not math.isfinite(m):
+        return None  # 归一化量有界，m 非有限只可能是 NaN，拟合不可表示
+    slope = m * (sy / sx)
+    intercept = sy * (mean_v - m * mean_u)  # ȳ − slope·x̄，在归一化量下乘回
+    # 残差与 RMS 先在 [−1,1] 量级内聚合再乘 sy：避免残差自身平方先溢出
+    norm_residuals = [b - m * a for a, b in zip(du, dv)]
+    residuals = [sy * nr for nr in norm_residuals]
+    rms = sy * math.sqrt(sum(nr * nr for nr in norm_residuals) / count)
+    if not all(math.isfinite(r) for r in residuals):
+        return None  # 逐光线残差不可表示（溢出为无穷或 NaN）
+    if not (math.isfinite(slope) and math.isfinite(intercept) and math.isfinite(rms)):
+        return None  # 斜率 / 截距 / RMS 不可表示：拟合直线在浮点下不可表示
     return intercept, slope, residuals, rms
 
 
