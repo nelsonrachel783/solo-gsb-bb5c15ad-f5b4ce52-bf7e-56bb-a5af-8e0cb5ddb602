@@ -368,11 +368,19 @@ def optical_path_length(
 def linear_least_squares(
     points: list[tuple[float, float]],
 ) -> tuple[float, float, list[float], float] | None:
-    """对 (x, y) 点集做等权最小二乘直线拟合 y = intercept + slope · x。
+    """对 (x, y) 点集做等权最小二乘直线拟合 y = intercept + slope · x（离差尺度归一化）。
 
     点数少于 WAVEFRONT_MIN_FIT_RAYS（3）或 x 全相同（斜率不可定）时返回
     None；否则返回 (intercept, slope, 逐点残差, 残差 RMS)，其中残差 =
     y − (intercept + slope · x)，RMS 为残差平方均值的开方。
+
+    数值稳定形式：均值与离差均按尺度归一化计算——各坐标先除以该坐标绝对值
+    的最大值再求均值（大坐标直接求和会溢出为无穷），再把 x / y 离差分别除以
+    各自的最大绝对离差（尺度因子），在归一化离差（落在 [-1, 1]，其平方和
+    不溢出）下求斜率与逐点残差，最后乘回尺度因子。因此偏移与光程同处
+    1e200 量级（如无界面、观察线 x=1e200、半角 30°）时，离差平方不再溢出，
+    拟合给出有限的斜率、截距、逐点残差与 RMS；斜率、截距、残差或 RMS 不可
+    表示（非有限值，如尺度比溢出）时返回 None。
     """
     count = len(points)
     if count < WAVEFRONT_MIN_FIT_RAYS:
@@ -380,16 +388,49 @@ def linear_least_squares(
     x0 = points[0][0]
     if all(p[0] == x0 for p in points):
         return None  # 偏移全相同：0/0，斜率不可定
-    mean_x = sum(p[0] for p in points) / count
-    mean_y = sum(p[1] for p in points) / count
-    sxx = sum((p[0] - mean_x) ** 2 for p in points)
-    if sxx == 0.0:
-        return None  # 数值兜底：离差平方和为 0 等价于 x 全同
-    sxy = sum((p[0] - mean_x) * (p[1] - mean_y) for p in points)
-    slope = sxy / sxx
+
+    # 尺度归一化的均值：各坐标先除以该坐标绝对值的最大值再平均，
+    # 避免大坐标（如 1e200 量级的偏移与光程）直接求和溢出为无穷
+    x_mag = max(abs(p[0]) for p in points)
+    y_mag = max(abs(p[1]) for p in points)
+    mean_x = x_mag * (sum(p[0] / x_mag for p in points) / count)
+    mean_y = y_mag * (sum(p[1] / y_mag for p in points) / count) if y_mag > 0.0 else 0.0
+
+    # 离差尺度：各自的最大绝对离差；归一化离差落在 [-1, 1]，其平方和不再溢出
+    deviations_x = [p[0] - mean_x for p in points]
+    deviations_y = [p[1] - mean_y for p in points]
+    x_scale = max(abs(d) for d in deviations_x)
+    y_scale = max(abs(d) for d in deviations_y)
+    if x_scale == 0.0:
+        return None  # 数值兜底：离差全为 0 等价于 x 全同
+    if not (math.isfinite(x_scale) and math.isfinite(y_scale)):
+        return None  # 离差不可表示（inf 或 NaN）：拟合结果随之不可表示
+    if y_scale == 0.0:
+        # y 全相同：斜率严格为 0，截距即公共纵坐标，残差全为 0
+        return mean_y, 0.0, [0.0] * count, 0.0
+
+    ux = [d / x_scale for d in deviations_x]
+    uy = [d / y_scale for d in deviations_y]
+    sxx_u = sum(u * u for u in ux)  # >= 1：最大归一化离差恰为 ±1
+    sxy_u = sum(a * b for a, b in zip(ux, uy))
+    slope_u = sxy_u / sxx_u
+    if slope_u == 0.0:
+        slope = 0.0  # 数学斜率严格为 0，与尺度比是否溢出无关（避免 0×∞）
+    else:
+        slope = slope_u * (y_scale / x_scale)
+        if not math.isfinite(slope):
+            return None  # 斜率不可表示（离差尺度比溢出为无穷）
     intercept = mean_y - slope * mean_x
-    residuals = [p[1] - (intercept + slope * p[0]) for p in points]
-    rms = math.sqrt(sum(r * r for r in residuals) / count)
+    if not math.isfinite(intercept):
+        return None  # 截距不可表示
+    # 归一化残差有界（|uy| <= 1、|slope_u| <= sqrt(count)），乘回尺度得实际残差
+    residuals_u = [b - slope_u * a for a, b in zip(ux, uy)]
+    residuals = [y_scale * r for r in residuals_u]
+    if not all(math.isfinite(r) for r in residuals):
+        return None  # 残差不可表示
+    rms = y_scale * math.sqrt(sum(r * r for r in residuals_u) / count)
+    if not math.isfinite(rms):
+        return None  # RMS 不可表示
     return intercept, slope, residuals, rms
 
 
